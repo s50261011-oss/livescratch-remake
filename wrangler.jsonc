@@ -1,0 +1,46 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+
+  "name": "livescratch-remake",
+
+  "main": "src/index.js",
+
+  "compatibility_date": "2026-09-08",
+
+  "assets": {
+    "directory": "./extension",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "livescratch-db",
+      "database_id": "140febd4-0e37-4821-9d5c-b350efa0e487",
+      "migrations_dir": "./migrations"
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ROOMS",
+        "class_name": "Room"
+      }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "Room"
+      ]
+    }
+  ],
+
+  "observability": {
+    "enabled": true
+  }
+}
