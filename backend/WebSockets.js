@@ -6,10 +6,24 @@ export default class Room {
     this.sockets = new Map();
 
     /*
-     * Durable Objectごとに対応する
-     * roomIdを保存する
+     * Durable Objectごとに対応するroomId
      */
     this.roomId = null;
+
+    /*
+     * LiveScratch互換のプロジェクト状態
+     *
+     * {
+     *   title: "...",
+     *   version: 0,
+     *   changes: []
+     * }
+     */
+    this.project = {
+      title: "",
+      version: 0,
+      changes: []
+    };
   }
 
   async fetch(request) {
@@ -26,22 +40,16 @@ export default class Room {
     }
 
     /*
-     * src/index.jsから渡されたルームID
+     * Workerから渡される情報
      */
     this.roomId =
-      request.headers.get(
-        "X-Room-Id"
-      );
+      request.headers.get("X-Room-Id");
 
     const userId =
-      request.headers.get(
-        "X-User-Id"
-      );
+      request.headers.get("X-User-Id");
 
     const username =
-      request.headers.get(
-        "X-Username"
-      );
+      request.headers.get("X-Username");
 
     if (
       !this.roomId ||
@@ -67,13 +75,21 @@ export default class Room {
     const socketId =
       crypto.randomUUID();
 
+    const socketInfo = {
+      socket: server,
+      userId: String(userId),
+      username: String(username),
+
+      /*
+       * この接続が参加している
+       * LiveScratchセッション
+       */
+      sessions: new Set()
+    };
+
     this.sockets.set(
       socketId,
-      {
-        socket: server,
-        userId: String(userId),
-        username: String(username)
-      }
+      socketInfo
     );
 
     server.addEventListener(
@@ -92,11 +108,30 @@ export default class Room {
         const current =
           this.sockets.get(socketId);
 
-        this.sockets.delete(
-          socketId
-        );
+        this.sockets.delete(socketId);
 
         if (current) {
+          /*
+           * 参加中セッションから離脱
+           */
+          for (
+            const sessionId of current.sessions
+          ) {
+            this.broadcastToSession(
+              sessionId,
+              {
+                type: "member_leave",
+                username:
+                  current.username,
+                userId:
+                  current.userId
+              }
+            );
+          }
+
+          /*
+           * 新システム側のpresence
+           */
           this.broadcast({
             type: "presence",
             action: "leave",
@@ -110,9 +145,7 @@ export default class Room {
     server.addEventListener(
       "error",
       () => {
-        this.sockets.delete(
-          socketId
-        );
+        this.sockets.delete(socketId);
       }
     );
 
@@ -128,7 +161,7 @@ export default class Room {
     );
 
     /*
-     * 現在いるユーザーを送る
+     * 現在のメンバー
      */
     this.send(
       server,
@@ -146,7 +179,7 @@ export default class Room {
     );
 
     /*
-     * 他のユーザーへ入室通知
+     * 他ユーザーへ入室通知
      */
     this.broadcast({
       type: "presence",
@@ -160,11 +193,22 @@ export default class Room {
     });
   }
 
+  /*
+   * --------------------------------------------------
+   * 基本送信
+   * --------------------------------------------------
+   */
+
   send(socket, data) {
     try {
-      socket.send(
-        JSON.stringify(data)
-      );
+      if (
+        socket.readyState ===
+        WebSocket.OPEN
+      ) {
+        socket.send(
+          JSON.stringify(data)
+        );
+      }
     } catch {
       // 接続切れ
     }
@@ -181,9 +225,12 @@ export default class Room {
       ] of this.sockets
     ) {
       try {
-        client.socket.send(
-          message
-        );
+        if (
+          client.socket.readyState ===
+          WebSocket.OPEN
+        ) {
+          client.socket.send(message);
+        }
       } catch {
         this.sockets.delete(
           socketId
@@ -191,6 +238,59 @@ export default class Room {
       }
     }
   }
+
+  /*
+   * 特定のLiveScratchセッションだけへ送信
+   */
+  broadcastToSession(
+    sessionId,
+    data,
+    exceptSocketId = null
+  ) {
+    const message =
+      JSON.stringify(data);
+
+    for (
+      const [
+        socketId,
+        client
+      ] of this.sockets
+    ) {
+      if (
+        socketId ===
+        exceptSocketId
+      ) {
+        continue;
+      }
+
+      if (
+        !client.sessions.has(
+          sessionId
+        )
+      ) {
+        continue;
+      }
+
+      try {
+        if (
+          client.socket.readyState ===
+          WebSocket.OPEN
+        ) {
+          client.socket.send(message);
+        }
+      } catch {
+        this.sockets.delete(
+          socketId
+        );
+      }
+    }
+  }
+
+  /*
+   * --------------------------------------------------
+   * メッセージ処理
+   * --------------------------------------------------
+   */
 
   async handleMessage(
     socketId,
@@ -222,14 +322,336 @@ export default class Room {
     }
 
     /*
+     * ------------------------------------------------
+     * 元LiveScratch互換
+     * ------------------------------------------------
+     */
+
+    /*
+     * joinSession
+     *
+     * 1つのLiveScratchプロジェクトへ参加
+     */
+    if (
+      data.type ===
+      "joinSession"
+    ) {
+      const sessionId =
+        this.getSessionId(data);
+
+      if (!sessionId) {
+        return;
+      }
+
+      client.sessions.add(
+        sessionId
+      );
+
+      /*
+       * 現在の参加者を本人へ通知
+       */
+      const members =
+        [...this.sockets.values()]
+          .filter(socket =>
+            socket.sessions.has(
+              sessionId
+            )
+          )
+          .map(socket => ({
+            userId:
+              socket.userId,
+            username:
+              socket.username
+          }));
+
+      this.send(
+        client.socket,
+        {
+          type: "sessionJoined",
+          sessionId,
+          members
+        }
+      );
+
+      /*
+       * 他の参加者へ通知
+       */
+      this.broadcastToSession(
+        sessionId,
+        {
+          type: "member_join",
+          sessionId,
+          userId:
+            client.userId,
+          username:
+            client.username
+        },
+        socketId
+      );
+
+      /*
+       * 現在のプロジェクト情報
+       */
+      this.send(
+        client.socket,
+        {
+          type: "yourVersion",
+          sessionId,
+          version:
+            this.project.version
+        }
+      );
+
+      return;
+    }
+
+    /*
+     * joinSessions
+     *
+     * 複数プロジェクトへ一括参加
+     */
+    if (
+      data.type ===
+      "joinSessions"
+    ) {
+      const sessions =
+        Array.isArray(
+          data.sessions
+        )
+          ? data.sessions
+          : [];
+
+      for (
+        const session of sessions
+      ) {
+        const sessionId =
+          typeof session === "string"
+            ? session
+            : (
+                session?.id ??
+                session?.sessionId
+              );
+
+        if (!sessionId) {
+          continue;
+        }
+
+        client.sessions.add(
+          String(sessionId)
+        );
+      }
+
+      /*
+       * 元LiveScratch側が
+       * 接続成功を受け取れるようにする
+       */
+      this.send(
+        client.socket,
+        {
+          type: "sessionsJoined",
+          sessions:
+            [...client.sessions]
+        }
+      );
+
+      return;
+    }
+
+    /*
+     * leaveSession
+     */
+    if (
+      data.type ===
+      "leaveSession"
+    ) {
+      const sessionId =
+        this.getSessionId(data);
+
+      if (!sessionId) {
+        return;
+      }
+
+      client.sessions.delete(
+        sessionId
+      );
+
+      this.broadcastToSession(
+        sessionId,
+        {
+          type: "member_leave",
+          sessionId,
+          userId:
+            client.userId,
+          username:
+            client.username
+        }
+      );
+
+      return;
+    }
+
+    /*
+     * projectChange
+     *
+     * Scratchプロジェクトの変更を
+     * 同じセッションのユーザーへ転送
+     */
+    if (
+      data.type ===
+      "projectChange"
+    ) {
+      const sessionId =
+        this.getSessionId(data);
+
+      if (!sessionId) {
+        return;
+      }
+
+      client.sessions.add(
+        sessionId
+      );
+
+      const version =
+        Number.isFinite(
+          Number(data.version)
+        )
+          ? Number(data.version)
+          : this.project.version + 1;
+
+      this.project.version =
+        Math.max(
+          this.project.version,
+          version
+        );
+
+      const change = {
+        type:
+          "projectChange",
+        sessionId,
+        username:
+          client.username,
+        userId:
+          client.userId,
+        version:
+          this.project.version,
+
+        /*
+         * 元LiveScratchから来る
+         * 実際の変更データをそのまま保持
+         */
+        data:
+          data.data ??
+          data.change ??
+          data.projectChange
+      };
+
+      /*
+       * 同じセッションへ送信
+       *
+       * 自分自身には返さない。
+       */
+      this.broadcastToSession(
+        sessionId,
+        change,
+        socketId
+      );
+
+      return;
+    }
+
+    /*
+     * setTitle
+     */
+    if (
+      data.type ===
+      "setTitle"
+    ) {
+      const sessionId =
+        this.getSessionId(data);
+
+      const title =
+        String(
+          data.title ?? ""
+        ).slice(0, 200);
+
+      if (sessionId) {
+        this.broadcastToSession(
+          sessionId,
+          {
+            type:
+              "setTitle",
+            sessionId,
+            username:
+              client.username,
+            title
+          },
+          socketId
+        );
+      }
+
+      /*
+       * 新システム側にも反映
+       */
+      this.project.title =
+        title;
+
+      return;
+    }
+
+    /*
+     * setCursor
+     *
+     * 他ユーザーのカーソル位置
+     */
+    if (
+      data.type ===
+      "setCursor"
+    ) {
+      const sessionId =
+        this.getSessionId(data);
+
+      if (!sessionId) {
+        return;
+      }
+
+      this.broadcastToSession(
+        sessionId,
+        {
+          type:
+            "setCursor",
+          sessionId,
+          username:
+            client.username,
+          userId:
+            client.userId,
+          cursor:
+            data.cursor ??
+            data.data ??
+            null
+        },
+        socketId
+      );
+
+      return;
+    }
+
+    /*
+     * ------------------------------------------------
+     * 新LiveScratch機能
+     * ------------------------------------------------
+     */
+
+    /*
      * チャット
      */
     if (
-      data.type === "chat"
+      data.type ===
+      "chat"
     ) {
       const text =
-        String(data.text || "")
-          .trim();
+        String(
+          data.text || ""
+        ).trim();
 
       if (!text) {
         return;
@@ -243,41 +665,41 @@ export default class Room {
         type: "chat",
         username:
           client.username,
+        userId:
+          client.userId,
         text,
         timestamp:
           Date.now()
       };
 
-      /*
-       * 全員へリアルタイム送信
-       */
       this.broadcast(message);
 
       /*
-       * D1にも保存
+       * D1保存
+       *
+       * messages.id は INTEGER AUTOINCREMENT
+       * なのでUUIDを入れない。
        */
       if (this.roomId) {
         try {
           await this.env.DB.prepare(`
             INSERT INTO messages (
-              id,
               room_id,
               user_id,
               text,
               created_at
             )
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
           `)
             .bind(
-              crypto.randomUUID(),
               this.roomId,
-              client.userId,
+              Number(client.userId),
               text
             )
             .run();
         } catch {
           /*
-           * チャット表示自体は
+           * チャット表示は
            * D1保存失敗で止めない
            */
         }
@@ -338,11 +760,14 @@ export default class Room {
       "voice-state"
     ) {
       this.broadcast({
-        type: "voice-state",
+        type:
+          "voice-state",
         username:
           client.username,
         enabled:
-          Boolean(data.enabled)
+          Boolean(
+            data.enabled
+          )
       });
 
       return;
@@ -356,9 +781,12 @@ export default class Room {
       "turbowarp"
     ) {
       this.broadcast({
-        type: "turbowarp",
+        type:
+          "turbowarp",
         username:
           client.username,
+        userId:
+          client.userId,
         data:
           data.data
       });
@@ -370,17 +798,57 @@ export default class Room {
      * ping
      */
     if (
-      data.type === "ping"
+      data.type ===
+      "ping"
     ) {
       this.send(
         client.socket,
         {
-          type: "pong",
+          type:
+            "pong",
           timestamp:
             Date.now()
         }
       );
 
+      return;
+    }
+  }
+
+  /*
+   * sessionIdをいろんな形式から取得
+   */
+  getSessionId(data) {
+    if (
+      data.sessionId !==
+      undefined
+    ) {
+      return String(
+        data.sessionId
+      );
+    }
+
+    if (
+      data.id !==
+      undefined
+    ) {
+      return String(
+        data.id
+      );
+    }
+
+    if (
+      data.lsId !==
+      undefined
+    ) {
+      return String(
+        data.lsId
+      );
+    }
+
+    return null;
+  }
+}
       return;
     }
   }
