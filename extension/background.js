@@ -9,7 +9,11 @@ self.addEventListener = (function (original) {
     };
 })(self.addEventListener);
 
-importScripts('background/socket.io.js', 'background/livescratchProject.js', 'background/auth.js');
+importScripts(
+  'background/cloudflareSocket.js',
+  'background/livescratchProject.js',
+  'background/auth.js'
+);
 
 const getStorageValue = (key) => {
     return new Promise((resolve, reject) => {
