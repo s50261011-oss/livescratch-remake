@@ -184,7 +184,15 @@ async function backgroundScript() {
     const URLApiUrl = new URL(apiUrl);
     const URLApiDomain = URLApiUrl.origin;
     const URLApiPath = [''].concat(URLApiUrl.pathname.split('/').filter(Boolean)).join('/');
-    const socket = io.connect(URLApiDomain, { path: `${URLApiPath}/socket.io/`, jsonp: false, transports: ['websocket', 'xhr-polling', 'polling', 'htmlfile', 'flashsocket'] });
+const socketUrl =
+  URLApiDomain.replace(/^http:/, "ws:")
+             .replace(/^https:/, "wss:")
+             .replace(/\/$/, "") +
+  "/ws/legacy";
+
+const socket = new CloudflareSocket(socketUrl);
+
+socket.connect();
     LIVESCRATCH.socket = socket;
     // const socket = io.connect(apiUrl,{jsonp:false,transports:['websocket']})
     // socket.on("connect_error", () => { socket.io.opts.transports = ["websocket"];});
