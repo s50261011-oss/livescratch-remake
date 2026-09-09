@@ -7,9 +7,10 @@ class CloudflareSocket {
 
     this.ws = null;
     this.connected = false;
+    this.connecting = false;
 
     this.listeners = new Map();
-    this.pendingConnect = null;
+    this.pendingCallbacks = [];
   }
 
   on(event, callback) {
@@ -38,144 +39,6 @@ class CloudflareSocket {
     return this;
   }
 
-  emit(event, ...args) {
-    if (event === "connect") {
-      return this.connect();
-    }
-
-    if (event === "disconnect") {
-      return this.disconnect();
-    }
-
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return this;
-    }
-
-    const message = {
-      type: event,
-      data: args
-    };
-
-    this.ws.send(JSON.stringify(message));
-
-    return this;
-  }
-
-  send(data) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return this;
-    }
-
-    this.ws.send(
-      typeof data === "string"
-        ? data
-        : JSON.stringify(data)
-    );
-
-    return this;
-  }
-
-  connect() {
-    if (
-      this.ws &&
-      (
-        this.ws.readyState === WebSocket.OPEN ||
-        this.ws.readyState === WebSocket.CONNECTING
-      )
-    ) {
-      return this;
-    }
-
-    if (this.pendingConnect) {
-      return this;
-    }
-
-    this.pendingConnect = true;
-
-    try {
-      this.ws = new WebSocket(this.url);
-
-      this.ws.addEventListener("open", () => {
-        this.pendingConnect = false;
-        this.connected = true;
-
-        this.dispatch("connect");
-      });
-
-      this.ws.addEventListener("message", event => {
-        this.handleMessage(event.data);
-      });
-
-      this.ws.addEventListener("close", () => {
-        this.pendingConnect = false;
-        this.connected = false;
-
-        this.dispatch("disconnect");
-      });
-
-      this.ws.addEventListener("error", error => {
-        this.dispatch("connect_error", error);
-      });
-    } catch (error) {
-      this.pendingConnect = false;
-      this.connected = false;
-
-      this.dispatch("connect_error", error);
-    }
-
-    return this;
-  }
-
-  disconnect() {
-    if (this.ws) {
-      try {
-        this.ws.close();
-      } catch {}
-    }
-
-    this.ws = null;
-    this.connected = false;
-
-    return this;
-  }
-
-  handleMessage(raw) {
-    let message;
-
-    try {
-      message =
-        typeof raw === "string"
-          ? JSON.parse(raw)
-          : raw;
-    } catch {
-      return;
-    }
-
-    if (!message) {
-      return;
-    }
-
-    /*
-     * Cloudflare側から
-     *
-     * {
-     *   type: "chat",
-     *   ...
-     * }
-     *
-     * のように届く場合
-     */
-    if (message.type) {
-      this.dispatch(message.type, message);
-    }
-
-    /*
-     * 元LiveScratch互換の
-     * "message" イベント
-     */
-    this.dispatch("message", message);
-  }
-
   dispatch(event, ...args) {
     const list = this.listeners.get(event);
 
@@ -193,6 +56,192 @@ class CloudflareSocket {
         );
       }
     }
+  }
+
+  connect() {
+    if (
+      this.ws &&
+      (
+        this.ws.readyState === WebSocket.OPEN ||
+        this.ws.readyState === WebSocket.CONNECTING
+      )
+    ) {
+      return this;
+    }
+
+    if (this.connecting) {
+      return this;
+    }
+
+    this.connecting = true;
+
+    try {
+      this.ws = new WebSocket(this.url);
+
+      this.ws.addEventListener("open", () => {
+        this.connecting = false;
+        this.connected = true;
+
+        this.dispatch("connect");
+      });
+
+      this.ws.addEventListener("message", event => {
+        this.handleMessage(event.data);
+      });
+
+      this.ws.addEventListener("close", event => {
+        this.connecting = false;
+        this.connected = false;
+
+        this.dispatch("disconnect", event);
+      });
+
+      this.ws.addEventListener("error", error => {
+        this.dispatch("connect_error", error);
+      });
+
+    } catch (error) {
+      this.connecting = false;
+      this.connected = false;
+
+      this.dispatch("connect_error", error);
+    }
+
+    return this;
+  }
+
+  disconnect() {
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch (error) {
+        console.error(
+          "[CloudflareSocket] close error",
+          error
+        );
+      }
+    }
+
+    this.ws = null;
+    this.connected = false;
+    this.connecting = false;
+
+    return this;
+  }
+
+  send(data, callback) {
+    if (
+      !this.ws ||
+      this.ws.readyState !== WebSocket.OPEN
+    ) {
+      if (typeof callback === "function") {
+        callback({
+          error: "WebSocket is not connected."
+        });
+      }
+
+      return this;
+    }
+
+    try {
+      this.ws.send(
+        typeof data === "string"
+          ? data
+          : JSON.stringify(data)
+      );
+
+      /*
+       * 元LiveScratchでは、
+       *
+       * socket.send(data, callback)
+       *
+       * の形が使われています。
+       *
+       * Cloudflare WebSocketではSocket.IOの
+       * ACKがないため、ここでは送信成功時に
+       * callbackを呼びます。
+       */
+      if (typeof callback === "function") {
+        callback(null);
+      }
+
+    } catch (error) {
+      console.error(
+        "[CloudflareSocket] send error",
+        error
+      );
+
+      if (typeof callback === "function") {
+        callback({
+          error: error.message
+        });
+      }
+    }
+
+    return this;
+  }
+
+  emit(event, ...args) {
+    /*
+     * connect / disconnect は
+     * Socket.IO互換として扱う。
+     */
+    if (event === "connect") {
+      return this.connect();
+    }
+
+    if (event === "disconnect") {
+      return this.disconnect();
+    }
+
+    /*
+     * Cloudflare WebSocketへ送信。
+     */
+    return this.send({
+      type: event,
+      data: args
+    });
+  }
+
+  handleMessage(raw) {
+    let message;
+
+    try {
+      message =
+        typeof raw === "string"
+          ? JSON.parse(raw)
+          : raw;
+    } catch (error) {
+      console.error(
+        "[CloudflareSocket] invalid message",
+        error
+      );
+
+      return;
+    }
+
+    if (!message) {
+      return;
+    }
+
+    /*
+     * typeごとのイベント
+     *
+     * 例:
+     * {
+     *   type: "projectChange",
+     *   ...
+     * }
+     */
+    if (message.type) {
+      this.dispatch(message.type, message);
+    }
+
+    /*
+     * 元LiveScratchが使用する
+     * socket.on("message", ...)
+     */
+    this.dispatch("message", message);
   }
 }
 
