@@ -1,48 +1,25 @@
+// backend/WebSockets.js
+
 export default class Room {
   constructor(state, env) {
     this.state = state;
     this.env = env;
 
     this.sockets = new Map();
-
-    /*
-     * Durable Objectごとに対応するroomId
-     */
-    this.roomId = null;
-
-    /*
-     * LiveScratch互換のプロジェクト状態
-     *
-     * {
-     *   title: "...",
-     *   version: 0,
-     *   changes: []
-     * }
-     */
-    this.project = {
-      title: "",
-      version: 0,
-      changes: []
-    };
   }
 
   async fetch(request) {
     if (
-      request.headers.get("Upgrade")
-        ?.toLowerCase() !== "websocket"
+      request.headers.get("Upgrade")?.toLowerCase() !==
+      "websocket"
     ) {
       return new Response(
-        "WebSocket endpoint",
-        {
-          status: 426
-        }
+        "WebSocket connection required.",
+        { status: 426 }
       );
     }
 
-    /*
-     * Workerから渡される情報
-     */
-    this.roomId =
+    const roomId =
       request.headers.get("X-Room-Id");
 
     const userId =
@@ -51,46 +28,38 @@ export default class Room {
     const username =
       request.headers.get("X-Username");
 
-    if (
-      !this.roomId ||
-      !userId ||
-      !username
-    ) {
+    const scratchId =
+      request.headers.get("X-Scratch-Id");
+
+    if (!roomId || !userId || !username) {
       return new Response(
-        "Authentication required",
-        {
-          status: 401
-        }
+        "Authentication information is missing.",
+        { status: 401 }
       );
     }
 
-    const pair =
-      new WebSocketPair();
+    const pair = new WebSocketPair();
 
     const client = pair[0];
     const server = pair[1];
 
     server.accept();
 
-    const socketId =
-      crypto.randomUUID();
+    const socketId = crypto.randomUUID();
 
-    const socketInfo = {
-      socket: server,
-      userId: String(userId),
-      username: String(username),
-
-      /*
-       * この接続が参加している
-       * LiveScratchセッション
-       */
-      sessions: new Set()
+    const user = {
+      socketId,
+      userId: Number(userId),
+      scratchId: scratchId
+        ? Number(scratchId)
+        : null,
+      username
     };
 
-    this.sockets.set(
-      socketId,
-      socketInfo
-    );
+    this.sockets.set(socketId, {
+      socket: server,
+      user
+    });
 
     server.addEventListener(
       "message",
@@ -105,87 +74,30 @@ export default class Room {
     server.addEventListener(
       "close",
       () => {
-        const current =
-          this.sockets.get(socketId);
-
-        this.sockets.delete(socketId);
-
-        if (current) {
-          /*
-           * 参加中セッションから離脱
-           */
-          for (
-            const sessionId of current.sessions
-          ) {
-            this.broadcastToSession(
-              sessionId,
-              {
-                type: "member_leave",
-                username:
-                  current.username,
-                userId:
-                  current.userId
-              }
-            );
-          }
-
-          /*
-           * 新システム側のpresence
-           */
-          this.broadcast({
-            type: "presence",
-            action: "leave",
-            username:
-              current.username
-          });
-        }
+        this.removeSocket(socketId);
       }
     );
 
     server.addEventListener(
       "error",
       () => {
-        this.sockets.delete(socketId);
+        this.removeSocket(socketId);
       }
     );
 
-    /*
-     * 接続完了
-     */
-    this.send(
-      server,
-      {
-        type: "connected",
-        username
-      }
-    );
+    this.send(server, {
+      type: "connected",
+      roomId,
+      user
+    });
 
-    /*
-     * 現在のメンバー
-     */
-    this.send(
-      server,
-      {
-        type: "members",
-        members:
-          [...this.sockets.values()]
-            .map(socket => ({
-              userId:
-                socket.userId,
-              username:
-                socket.username
-            }))
-      }
-    );
-
-    /*
-     * 他ユーザーへ入室通知
-     */
     this.broadcast({
       type: "presence",
       action: "join",
-      username
-    });
+      user
+    }, socketId);
+
+    this.sendMembers();
 
     return new Response(null, {
       status: 101,
@@ -193,109 +105,91 @@ export default class Room {
     });
   }
 
-  /*
-   * --------------------------------------------------
-   * 基本送信
-   * --------------------------------------------------
-   */
-
   send(socket, data) {
     try {
-      if (
-        socket.readyState ===
-        WebSocket.OPEN
-      ) {
-        socket.send(
-          JSON.stringify(data)
-        );
-      }
-    } catch {
-      // 接続切れ
+      socket.send(
+        JSON.stringify(data)
+      );
+    } catch (error) {
+      console.error(
+        "WebSocket send error:",
+        error
+      );
     }
   }
 
-  broadcast(data) {
-    const message =
-      JSON.stringify(data);
-
+  broadcast(data, exceptSocketId = null) {
     for (
       const [
         socketId,
-        client
-      ] of this.sockets
-    ) {
-      try {
-        if (
-          client.socket.readyState ===
-          WebSocket.OPEN
-        ) {
-          client.socket.send(message);
-        }
-      } catch {
-        this.sockets.delete(
-          socketId
-        );
-      }
-    }
-  }
-
-  /*
-   * 特定のLiveScratchセッションだけへ送信
-   */
-  broadcastToSession(
-    sessionId,
-    data,
-    exceptSocketId = null
-  ) {
-    const message =
-      JSON.stringify(data);
-
-    for (
-      const [
-        socketId,
-        client
+        connection
       ] of this.sockets
     ) {
       if (
-        socketId ===
-        exceptSocketId
+        socketId === exceptSocketId
       ) {
         continue;
       }
 
-      if (
-        !client.sessions.has(
-          sessionId
-        )
-      ) {
-        continue;
-      }
-
-      try {
-        if (
-          client.socket.readyState ===
-          WebSocket.OPEN
-        ) {
-          client.socket.send(message);
-        }
-      } catch {
-        this.sockets.delete(
-          socketId
-        );
-      }
+      this.send(
+        connection.socket,
+        data
+      );
     }
   }
 
-  /*
-   * --------------------------------------------------
-   * メッセージ処理
-   * --------------------------------------------------
-   */
+  sendMembers() {
+    const members = [];
 
-  async handleMessage(
-    socketId,
-    raw
-  ) {
+    for (
+      const connection of this.sockets.values()
+    ) {
+      members.push(
+        connection.user
+      );
+    }
+
+    const message = {
+      type: "members",
+      members
+    };
+
+    for (
+      const connection of this.sockets.values()
+    ) {
+      this.send(
+        connection.socket,
+        message
+      );
+    }
+  }
+
+  removeSocket(socketId) {
+    const connection =
+      this.sockets.get(socketId);
+
+    if (!connection) {
+      return;
+    }
+
+    this.sockets.delete(socketId);
+
+    this.broadcast({
+      type: "presence",
+      action: "leave",
+      user: connection.user
+    });
+
+    this.sendMembers();
+  }
+
+  getConnection(socketId) {
+    return this.sockets.get(
+      socketId
+    );
+  }
+
+  handleMessage(socketId, raw) {
     let data;
 
     try {
@@ -307,549 +201,458 @@ export default class Room {
       return;
     }
 
-    if (
-      !data ||
-      typeof data.type !== "string"
-    ) {
+    if (!data || typeof data !== "object") {
       return;
     }
 
-    const client =
-      this.sockets.get(socketId);
+    const connection =
+      this.getConnection(socketId);
 
-    if (!client) {
+    if (!connection) {
       return;
     }
+
+    const user =
+      connection.user;
 
     /*
-     * ------------------------------------------------
      * 元LiveScratch互換
-     * ------------------------------------------------
      */
-
-    /*
-     * joinSession
-     *
-     * 1つのLiveScratchプロジェクトへ参加
-     */
-    if (
-      data.type ===
-      "joinSession"
-    ) {
-      const sessionId =
-        this.getSessionId(data);
-
-      if (!sessionId) {
-        return;
-      }
-
-      client.sessions.add(
-        sessionId
-      );
-
-      /*
-       * 現在の参加者を本人へ通知
-       */
-      const members =
-        [...this.sockets.values()]
-          .filter(socket =>
-            socket.sessions.has(
-              sessionId
-            )
-          )
-          .map(socket => ({
-            userId:
-              socket.userId,
-            username:
-              socket.username
-          }));
-
-      this.send(
-        client.socket,
-        {
-          type: "sessionJoined",
-          sessionId,
-          members
-        }
-      );
-
-      /*
-       * 他の参加者へ通知
-       */
-      this.broadcastToSession(
-        sessionId,
-        {
-          type: "member_join",
-          sessionId,
-          userId:
-            client.userId,
-          username:
-            client.username
-        },
-        socketId
-      );
-
-      /*
-       * 現在のプロジェクト情報
-       */
-      this.send(
-        client.socket,
-        {
-          type: "yourVersion",
-          sessionId,
-          version:
-            this.project.version
-        }
-      );
-
-      return;
-    }
-
-    /*
-     * joinSessions
-     *
-     * 複数プロジェクトへ一括参加
-     */
-    if (
-      data.type ===
-      "joinSessions"
-    ) {
-      const sessions =
-        Array.isArray(
-          data.sessions
-        )
-          ? data.sessions
-          : [];
-
-      for (
-        const session of sessions
-      ) {
-        const sessionId =
-          typeof session === "string"
-            ? session
-            : (
-                session?.id ??
-                session?.sessionId
-              );
-
-        if (!sessionId) {
-          continue;
-        }
-
-        client.sessions.add(
-          String(sessionId)
+    switch (data.type) {
+      case "joinSession":
+        this.handleJoinSession(
+          socketId,
+          data
         );
-      }
+        break;
 
-      /*
-       * 元LiveScratch側が
-       * 接続成功を受け取れるようにする
-       */
-      this.send(
-        client.socket,
-        {
-          type: "sessionsJoined",
-          sessions:
-            [...client.sessions]
-        }
-      );
-
-      return;
-    }
-
-    /*
-     * leaveSession
-     */
-    if (
-      data.type ===
-      "leaveSession"
-    ) {
-      const sessionId =
-        this.getSessionId(data);
-
-      if (!sessionId) {
-        return;
-      }
-
-      client.sessions.delete(
-        sessionId
-      );
-
-      this.broadcastToSession(
-        sessionId,
-        {
-          type: "member_leave",
-          sessionId,
-          userId:
-            client.userId,
-          username:
-            client.username
-        }
-      );
-
-      return;
-    }
-
-    /*
-     * projectChange
-     *
-     * Scratchプロジェクトの変更を
-     * 同じセッションのユーザーへ転送
-     */
-    if (
-      data.type ===
-      "projectChange"
-    ) {
-      const sessionId =
-        this.getSessionId(data);
-
-      if (!sessionId) {
-        return;
-      }
-
-      client.sessions.add(
-        sessionId
-      );
-
-      const version =
-        Number.isFinite(
-          Number(data.version)
-        )
-          ? Number(data.version)
-          : this.project.version + 1;
-
-      this.project.version =
-        Math.max(
-          this.project.version,
-          version
+      case "joinSessions":
+        this.handleJoinSessions(
+          socketId,
+          data
         );
+        break;
 
-      const change = {
-        type:
-          "projectChange",
-        sessionId,
-        username:
-          client.username,
-        userId:
-          client.userId,
-        version:
-          this.project.version,
+      case "leaveSession":
+        this.handleLeaveSession(
+          socketId,
+          data
+        );
+        break;
 
-        /*
-         * 元LiveScratchから来る
-         * 実際の変更データをそのまま保持
-         */
-        data:
-          data.data ??
-          data.change ??
-          data.projectChange
-      };
+      case "projectChange":
+        this.handleProjectChange(
+          socketId,
+          data
+        );
+        break;
+
+      case "setTitle":
+        this.handleSetTitle(
+          socketId,
+          data
+        );
+        break;
+
+      case "setCursor":
+        this.handleSetCursor(
+          socketId,
+          data
+        );
+        break;
+
+      case "chat":
+        this.handleChat(
+          socketId,
+          data
+        );
+        break;
 
       /*
-       * 同じセッションへ送信
-       *
-       * 自分自身には返さない。
+       * 音声通話用
        */
-      this.broadcastToSession(
-        sessionId,
-        change,
-        socketId
-      );
+      case "voice-offer":
+      case "voice-answer":
+      case "voice-ice":
+        this.handleVoiceSignal(
+          socketId,
+          data
+        );
+        break;
 
-      return;
-    }
+      case "voice-state":
+        this.handleVoiceState(
+          socketId,
+          data
+        );
+        break;
 
-    /*
-     * setTitle
-     */
-    if (
-      data.type ===
-      "setTitle"
-    ) {
-      const sessionId =
-        this.getSessionId(data);
-
-      const title =
-        String(
-          data.title ?? ""
-        ).slice(0, 200);
-
-      if (sessionId) {
-        this.broadcastToSession(
-          sessionId,
+      /*
+       * TurboWarp関連
+       */
+      case "turbowarp":
+        this.broadcast(
           {
-            type:
-              "setTitle",
-            sessionId,
-            username:
-              client.username,
-            title
+            type: "turbowarp",
+            from: user,
+            data: data.data
           },
           socketId
         );
-      }
+        break;
 
       /*
-       * 新システム側にも反映
+       * 接続確認
        */
-      this.project.title =
-        title;
-
-      return;
-    }
-
-    /*
-     * setCursor
-     *
-     * 他ユーザーのカーソル位置
-     */
-    if (
-      data.type ===
-      "setCursor"
-    ) {
-      const sessionId =
-        this.getSessionId(data);
-
-      if (!sessionId) {
-        return;
-      }
-
-      this.broadcastToSession(
-        sessionId,
-        {
-          type:
-            "setCursor",
-          sessionId,
-          username:
-            client.username,
-          userId:
-            client.userId,
-          cursor:
-            data.cursor ??
-            data.data ??
-            null
-        },
-        socketId
-      );
-
-      return;
-    }
-
-    /*
-     * ------------------------------------------------
-     * 新LiveScratch機能
-     * ------------------------------------------------
-     */
-
-    /*
-     * チャット
-     */
-    if (
-      data.type ===
-      "chat"
-    ) {
-      const text =
-        String(
-          data.text || ""
-        ).trim();
-
-      if (!text) {
-        return;
-      }
-
-      if (text.length > 2000) {
-        return;
-      }
-
-      const message = {
-        type: "chat",
-        username:
-          client.username,
-        userId:
-          client.userId,
-        text,
-        timestamp:
-          Date.now()
-      };
-
-      this.broadcast(message);
-
-      /*
-       * D1保存
-       *
-       * messages.id は INTEGER AUTOINCREMENT
-       * なのでUUIDを入れない。
-       */
-      if (this.roomId) {
-        try {
-          await this.env.DB.prepare(`
-            INSERT INTO messages (
-              room_id,
-              user_id,
-              text,
-              created_at
-            )
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-          `)
-            .bind(
-              this.roomId,
-              Number(client.userId),
-              text
-            )
-            .run();
-        } catch {
-          /*
-           * チャット表示は
-           * D1保存失敗で止めない
-           */
-        }
-      }
-
-      return;
-    }
-
-    /*
-     * WebRTC offer / answer / ICE
-     */
-    if (
-      data.type ===
-        "voice-offer" ||
-      data.type ===
-        "voice-answer" ||
-      data.type ===
-        "voice-ice"
-    ) {
-      const target =
-        String(
-          data.target || ""
+      case "ping":
+        this.send(
+          connection.socket,
+          {
+            type: "pong",
+            time: Date.now()
+          }
         );
+        break;
 
-      if (!target) {
-        return;
-      }
-
-      const targetClient =
-        [...this.sockets.values()]
-          .find(
-            socket =>
-              socket.username ===
-              target
-          );
-
-      if (!targetClient) {
-        return;
-      }
-
-      this.send(
-        targetClient.socket,
-        {
-          ...data,
-          from:
-            client.username
-        }
-      );
-
-      return;
-    }
-
-    /*
-     * ボイス状態
-     */
-    if (
-      data.type ===
-      "voice-state"
-    ) {
-      this.broadcast({
-        type:
-          "voice-state",
-        username:
-          client.username,
-        enabled:
-          Boolean(
-            data.enabled
-          )
-      });
-
-      return;
-    }
-
-    /*
-     * TurboWarp同期
-     */
-    if (
-      data.type ===
-      "turbowarp"
-    ) {
-      this.broadcast({
-        type:
-          "turbowarp",
-        username:
-          client.username,
-        userId:
-          client.userId,
-        data:
-          data.data
-      });
-
-      return;
-    }
-
-    /*
-     * ping
-     */
-    if (
-      data.type ===
-      "ping"
-    ) {
-      this.send(
-        client.socket,
-        {
-          type:
-            "pong",
-          timestamp:
-            Date.now()
-        }
-      );
-
-      return;
+      default:
+        console.log(
+          "Unknown WebSocket message:",
+          data.type
+        );
+        break;
     }
   }
 
   /*
-   * sessionIdをいろんな形式から取得
+   * LiveScratch:
+   * joinSession
    */
-  getSessionId(data) {
-    if (
-      data.sessionId !==
-      undefined
-    ) {
-      return String(
-        data.sessionId
-      );
-    }
+  handleJoinSession(socketId, data) {
+    const connection =
+      this.getConnection(socketId);
 
-    if (
-      data.id !==
-      undefined
-    ) {
-      return String(
-        data.id
-      );
-    }
-
-    if (
-      data.lsId !==
-      undefined
-    ) {
-      return String(
-        data.lsId
-      );
-    }
-
-    return null;
-  }
-}
+    if (!connection) {
       return;
     }
+
+    const id =
+      data.id ?? data.blId;
+
+    if (!id) {
+      return;
+    }
+
+    if (!connection.sessions) {
+      connection.sessions =
+        new Set();
+    }
+
+    connection.sessions.add(
+      String(id)
+    );
+
+    this.send(
+      connection.socket,
+      {
+        type: "sessionJoined",
+        id: String(id)
+      }
+    );
+  }
+
+  /*
+   * LiveScratch:
+   * joinSessions
+   */
+  handleJoinSessions(socketId, data) {
+    const connection =
+      this.getConnection(socketId);
+
+    if (!connection) {
+      return;
+    }
+
+    if (!connection.sessions) {
+      connection.sessions =
+        new Set();
+    }
+
+    const ids =
+      Array.isArray(data.ids)
+        ? data.ids
+        : [];
+
+    for (const id of ids) {
+      if (id == null) {
+        continue;
+      }
+
+      connection.sessions.add(
+        String(id)
+      );
+    }
+
+    this.send(
+      connection.socket,
+      {
+        type: "sessionsJoined",
+        ids: ids.map(String)
+      }
+    );
+  }
+
+  /*
+   * LiveScratch:
+   * leaveSession
+   */
+  handleLeaveSession(socketId, data) {
+    const connection =
+      this.getConnection(socketId);
+
+    if (!connection) {
+      return;
+    }
+
+    if (!connection.sessions) {
+      return;
+    }
+
+    const id =
+      data.id ?? data.blId;
+
+    if (id == null) {
+      return;
+    }
+
+    connection.sessions.delete(
+      String(id)
+    );
+  }
+
+  /*
+   * LiveScratch:
+   * projectChange
+   */
+  handleProjectChange(socketId, data) {
+    const connection =
+      this.getConnection(socketId);
+
+    if (!connection) {
+      return;
+    }
+
+    const blId =
+      data.blId ?? data.id;
+
+    if (!blId) {
+      return;
+    }
+
+    this.broadcast(
+      {
+        type: "projectChange",
+        blId: String(blId),
+        version:
+          data.version ?? null,
+        msg: data.msg,
+        from: socketId,
+        user:
+          connection.user.username
+      },
+      socketId
+    );
+  }
+
+  /*
+   * LiveScratch:
+   * setTitle
+   */
+  handleSetTitle(socketId, data) {
+    const connection =
+      this.getConnection(socketId);
+
+    if (!connection) {
+      return;
+    }
+
+    const blId =
+      data.blId ?? data.id;
+
+    this.broadcast(
+      {
+        type: "setTitle",
+        blId:
+          blId != null
+            ? String(blId)
+            : null,
+        msg: data.msg,
+        from: socketId,
+        user:
+          connection.user.username
+      },
+      socketId
+    );
+  }
+
+  /*
+   * LiveScratch:
+   * setCursor
+   */
+  handleSetCursor(socketId, data) {
+    const connection =
+      this.getConnection(socketId);
+
+    if (!connection) {
+      return;
+    }
+
+    const blId =
+      data.blId ?? data.id;
+
+    this.broadcast(
+      {
+        type: "setCursor",
+        blId:
+          blId != null
+            ? String(blId)
+            : null,
+        cursor: data.cursor,
+        from: socketId,
+        user:
+          connection.user.username
+      },
+      socketId
+    );
+  }
+
+  /*
+   * リアルタイムチャット
+   */
+  async handleChat(socketId, data) {
+    const connection =
+      this.getConnection(socketId);
+
+    if (!connection) {
+      return;
+    }
+
+    let text = "";
+
+    if (
+      data.msg &&
+      data.msg.msg &&
+      typeof data.msg.msg.text !==
+        "undefined"
+    ) {
+      text =
+        String(data.msg.msg.text);
+    } else if (
+      data.msg &&
+      typeof data.msg.text !==
+        "undefined"
+    ) {
+      text =
+        String(data.msg.text);
+    } else if (
+      typeof data.text !==
+        "undefined"
+    ) {
+      text =
+        String(data.text);
+    }
+
+    if (!text.trim()) {
+      return;
+    }
+
+    const message = {
+      type: "chat",
+      blId:
+        data.blId ?? null,
+      msg: {
+        msg: {
+          text,
+          sender:
+            connection.user.username
+        }
+      },
+      user:
+        connection.user.username,
+      createdAt: Date.now()
+    };
+
+    this.broadcast(
+      message
+    );
+
+    /*
+     * D1にも保存
+     */
+    try {
+      const roomId =
+        data.roomId ??
+        this.state.id.toString();
+
+      if (this.env.DB) {
+        await this.env.DB.prepare(`
+          INSERT INTO messages
+            (room_id, user_id, text)
+          VALUES (?, ?, ?)
+        `)
+          .bind(
+            roomId,
+            connection.user.userId,
+            text
+          )
+          .run();
+      }
+    } catch (error) {
+      console.error(
+        "Failed to save chat:",
+        error
+      );
+    }
+  }
+
+  /*
+   * WebRTCシグナリング
+   */
+  handleVoiceSignal(socketId, data) {
+    const connection =
+      this.getConnection(socketId);
+
+    if (!connection) {
+      return;
+    }
+
+    this.broadcast(
+      {
+        type: data.type,
+        from: connection.user,
+        data: data.data
+      },
+      socketId
+    );
+  }
+
+  /*
+   * マイクON/OFFなど
+   */
+  handleVoiceState(socketId, data) {
+    const connection =
+      this.getConnection(socketId);
+
+    if (!connection) {
+      return;
+    }
+
+    this.broadcast(
+      {
+        type: "voice-state",
+        from: connection.user,
+        state: data.state
+      },
+      socketId
+    );
   }
 }
