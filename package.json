@@ -1,0 +1,16 @@
+{
+  "name": "livescratch-remake-api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Workers + D1 backend for LiveScratch-remake",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create livescratch-remake",
+    "db:local": "wrangler d1 execute livescratch-remake --local --file=./schema.sql",
+    "db:remote": "wrangler d1 execute livescratch-remake --remote --file=./schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
