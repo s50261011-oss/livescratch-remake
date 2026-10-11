@@ -1,0 +1,13 @@
+name = "livescratch-remake-api"
+main = "worker.js"
+compatibility_date = "2026-10-07"
+
+[vars]
+# 開発時だけ true にすると認証コードをAPIレスポンスへ返します。
+# 本番では false にしてください。
+DEV_MODE = "true"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "livescratch-remake"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
